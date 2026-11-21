@@ -1,0 +1,7 @@
+config.json
+snapshots/
+weread_qr.png
+monitor.log
+__pycache__/
+*.pyc
+wewe-data/

@@ -1,0 +1,50 @@
+name: Feed Patrol
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 24 小时全天候最高频巡检：每 5 分钟触发一次 + 任务内每 20 秒连查 3 次 (Public 仓库无限免费额度)
+    - cron: "*/5 * * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: feed-patrol
+  cancel-in-progress: false
+
+jobs:
+  patrol:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install --quiet requests "qrcode[pil]" pillow
+
+      - name: Run high-frequency burst patrol & Bark push
+        env:
+          BARK_KEY: ${{ secrets.BARK_KEY }}
+          WEREAD_COOKIE: ${{ secrets.WEREAD_COOKIE }}
+          MONITOR_TARGETS_JSON: ${{ secrets.MONITOR_TARGETS_JSON }}
+          BARK_MODE: silent_pin
+        run: |
+          python3 wechat_monitor.py --burst-seconds 42 --burst-interval 20
+
+      - name: Persist deduplication hashes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state.json || true
+          if ! git diff --staged --quiet; then
+            git commit -m "chore(state): update seen item hashes [skip ci]"
+            git pull --rebase origin main || true
+            git push origin main
+          fi
