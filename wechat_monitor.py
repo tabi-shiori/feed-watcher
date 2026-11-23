@@ -222,6 +222,7 @@ def build_bark_payload(
     mode = cfg.get("bark_mode", "silent_pin")
     payload: Dict[str, Any] = {
         "device_key": device_key,
+        "id": f"mp_{sha20(title)}",
         "title": notif_title,
         "subtitle": notif_subtitle,
         "body": notif_body,
@@ -771,7 +772,7 @@ def run_check_cycle(
                     "account": "监控系统告警",
                     "title": "⚠️ 微信读书登录已过期，请重新扫码",
                     "published_at": now_str,
-                    "url": "https://github.com/tabi-shiori/feed-patrol/actions",
+                    "url": "https://github.com/tabi-shiori/feed-watcher/actions",
                     "summary": "微信读书长效凭证已过期（HTTP 401），请重新扫一次微信读书二维码恢复监控。",
                 },
                 cfg,
@@ -808,11 +809,37 @@ def get_sample_latest_article() -> Dict[str, Any]:
     }
 
 
+def git_sync_state_if_needed() -> None:
+    """在长驻 GitHub Actions 容器运行期间，一旦发现新文章更新了 state.json，立即实时 push 回仓库。"""
+    if os.environ.get("GITHUB_ACTIONS") != "true":
+        return
+    try:
+        import subprocess
+        subprocess.run(["git", "config", "user.name", "github-actions[bot]"], cwd=BASE_DIR, check=False)
+        subprocess.run(
+            ["git", "config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com"],
+            cwd=BASE_DIR,
+            check=False,
+        )
+        subprocess.run(["git", "add", "state.json"], cwd=BASE_DIR, check=False)
+        diff_res = subprocess.run(["git", "diff", "--staged", "--quiet"], cwd=BASE_DIR)
+        if diff_res.returncode != 0:
+            subprocess.run(
+                ["git", "commit", "-m", "chore(state): update seen item hashes [skip ci]"],
+                cwd=BASE_DIR,
+                check=False,
+            )
+            subprocess.run(["git", "pull", "--rebase", "origin", "main"], cwd=BASE_DIR, check=False)
+            subprocess.run(["git", "push", "origin", "main"], cwd=BASE_DIR, check=False)
+    except Exception as exc:
+        logger.warning("Git sync warning: %s", exc)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Privacy-preserving feed update notifier")
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--burst-seconds", type=int, default=0)
-    parser.add_argument("--burst-interval", type=int, default=20)
+    parser.add_argument("--burst-interval", type=int, default=60)
     parser.add_argument("--test-bark", action="store_true")
     parser.add_argument("--bark-key", type=str, default="")
     parser.add_argument("--gen-qr", action="store_true")
@@ -840,18 +867,22 @@ def main() -> None:
         while True:
             round_idx += 1
             cfg = load_config()
-            last_res = run_check_cycle(cfg, force_refresh=(round_idx == 1))
-            logger.info(
-                "Burst check #%d | auth=%s | scanned=%d | new=%d",
-                round_idx,
-                last_res.get("auth_valid"),
-                last_res.get("articles_scanned", 0),
-                last_res.get("new_articles_count", 0),
-            )
+            last_res = run_check_cycle(cfg, force_refresh=(round_idx % 15 == 1))
+            if last_res.get("new_articles_count", 0) > 0:
+                git_sync_state_if_needed()
+            if round_idx == 1 or round_idx % 10 == 0 or last_res.get("new_articles_count", 0) > 0:
+                logger.info(
+                    "Patrol #%d | auth=%s | scanned=%d | new=%d",
+                    round_idx,
+                    last_res.get("auth_valid"),
+                    last_res.get("articles_scanned", 0),
+                    last_res.get("new_articles_count", 0),
+                )
             elapsed = time.time() - start_ts
             if elapsed + args.burst_interval > args.burst_seconds:
                 break
             time.sleep(args.burst_interval)
+        git_sync_state_if_needed()
         print(json.dumps(last_res, ensure_ascii=False, indent=2))
         return
 

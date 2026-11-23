@@ -3,8 +3,12 @@ name: Feed Patrol
 on:
   workflow_dispatch:
   schedule:
-    # 24 小时全天候最高频巡检：每 5 分钟触发一次 + 任务内每 20 秒连查 3 次 (Public 仓库无限免费额度)
-    - cron: "*/5 * * * *"
+    # 多路错峰唤醒 + 5.5 小时超长常驻容器接力模式：
+    # 即使 GitHub 定时调度器隔 2~4 小时才触发一次，也会在当前 5.5 小时常驻容器运行期间进入等待队列，
+    # 在上一棒结束瞬间无缝接力启动下一棒，实现 24 小时不间断的“每 60 秒”实时巡检！
+    - cron: "12 * * * *"
+    - cron: "42 * * * *"
+    - cron: "55 23 * * *"
 
 permissions:
   contents: write
@@ -16,7 +20,7 @@ concurrency:
 jobs:
   patrol:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 350
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -29,16 +33,17 @@ jobs:
       - name: Install dependencies
         run: pip install --quiet requests "qrcode[pil]" pillow
 
-      - name: Run high-frequency burst patrol & Bark push
+      - name: Run 5.5-hour continuous patrol daemon (60s interval) & instant Bark push
         env:
           BARK_KEY: ${{ secrets.BARK_KEY }}
           WEREAD_COOKIE: ${{ secrets.WEREAD_COOKIE }}
           MONITOR_TARGETS_JSON: ${{ secrets.MONITOR_TARGETS_JSON }}
           BARK_MODE: silent_pin
         run: |
-          python3 wechat_monitor.py --burst-seconds 42 --burst-interval 20
+          python3 wechat_monitor.py --burst-seconds 19800 --burst-interval 60
 
-      - name: Persist deduplication hashes
+      - name: Persist deduplication hashes on exit
+        if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
