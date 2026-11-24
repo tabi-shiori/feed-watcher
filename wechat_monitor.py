@@ -67,6 +67,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "night_interval_sec": 900,
 }
 
+_ACTIVE_COOKIE_STR: str = ""
+
 
 def sha20(value: str) -> str:
     """计算单向 SHA-256 摘要（前 20 位十六进制），用于无明文隐私去重。"""
@@ -112,6 +114,8 @@ def load_config(path: Path = CONFIG_PATH) -> Dict[str, Any]:
         cfg["bark_mode"] = os.environ["BARK_MODE"].strip()
     if os.environ.get("WEREAD_COOKIE"):
         cfg["weread_cookie"] = os.environ["WEREAD_COOKIE"].strip()
+    if _ACTIVE_COOKIE_STR:
+        cfg["weread_cookie"] = _ACTIVE_COOKIE_STR
     if os.environ.get("MONITOR_TARGETS_JSON"):
         try:
             targets = json.loads(os.environ["MONITOR_TARGETS_JSON"])
@@ -528,11 +532,13 @@ _last_cookie_renew_ts: float = 0.0
 
 
 def renew_weread_cookie_if_needed(cookie_str: str, force: bool = False) -> str:
-    global _last_cookie_renew_ts
+    global _last_cookie_renew_ts, _ACTIVE_COOKIE_STR
     now = time.time()
-    if not force and _last_cookie_renew_ts and (now - _last_cookie_renew_ts < 4 * 3600):
-        return cookie_str
+    # wr_skey 有效期为 5400 秒（90 分钟），因此进程启动首次及每 35 分钟（2100 秒）主动用 wr_rt 静默续期
+    if not force and _last_cookie_renew_ts and (now - _last_cookie_renew_ts < 2100):
+        return _ACTIVE_COOKIE_STR or cookie_str
 
+    base_cookie = _ACTIVE_COOKIE_STR or cookie_str
     try:
         sess = requests.Session()
         sess.headers.update(
@@ -544,32 +550,36 @@ def renew_weread_cookie_if_needed(cookie_str: str, force: bool = False) -> str:
             }
         )
         cookies_dict: Dict[str, str] = {}
-        for part in cookie_str.split(";"):
+        for part in base_cookie.split(";"):
             if "=" in part:
                 k, v = part.strip().split("=", 1)
                 cookies_dict[k.strip()] = v.strip()
                 sess.cookies.set(k.strip(), v.strip(), domain="weread.qq.com")
 
+        # 根据 cookie 中的 wr_ql 自动匹配 ql 参数（wr_ql=0 时必须传 ql=False，否则报 -2013）
+        ql_flag = cookies_dict.get("wr_ql") == "1"
         r = sess.post(
             f"{WEREAD_BASE}/web/login/renewal",
-            json={"rq": "%2Fweb%2Fbook%2Fread", "ql": True},
-            timeout=10,
+            json={"rq": "%2Fweb%2Fmp%2Fcover", "ql": ql_flag},
+            timeout=12,
         )
         _last_cookie_renew_ts = now
         if r.status_code == 200:
             rj = r.json()
-            if not rj.get("errCode") and not rj.get("errcode") and rj.get("accessToken"):
+            if not rj.get("errCode") and not rj.get("errcode"):
                 for c in sess.cookies:
                     cookies_dict[c.name] = c.value
-                cookies_dict["wr_skey"] = str(rj["accessToken"])
+                if rj.get("accessToken"):
+                    cookies_dict["wr_skey"] = str(rj["accessToken"])
                 new_cookie_str = "; ".join(f"{k}={v}" for k, v in cookies_dict.items() if v)
-                if new_cookie_str and new_cookie_str != cookie_str:
-                    if os.environ.get("GITHUB_ACTIONS") != "true":
+                if new_cookie_str:
+                    _ACTIVE_COOKIE_STR = new_cookie_str
+                    if os.environ.get("GITHUB_ACTIONS") != "true" and new_cookie_str != cookie_str:
                         save_config({"weread_cookie": new_cookie_str})
                     return new_cookie_str
     except Exception:
         pass
-    return cookie_str
+    return base_cookie
 
 
 def fetch_weread_direct_articles(
@@ -578,19 +588,22 @@ def fetch_weread_direct_articles(
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     global _last_backup_check_ts
     cfg = config or load_config()
-    cookie_str = (cfg.get("weread_cookie") or "").strip()
+    raw_cookie = (cfg.get("weread_cookie") or "").strip()
     book_map: Dict[str, str] = dict(cfg.get("monitored_book_ids") or {})
 
     diag: Dict[str, Any] = {
         "mode": "weread_direct_light",
-        "cookie_configured": bool(cookie_str),
+        "cookie_configured": bool(raw_cookie),
         "auth_valid": False,
         "feeds_checked": 0,
         "errors": [],
     }
-    if not cookie_str:
+    if not raw_cookie:
         diag["errors"].append("missing_cookie")
         return [], diag
+
+    # 主动确保 wr_skey 处于有效期内（避免 /api/mp/cover 在过期时仍返回 200 静态旧缓存）
+    cookie_str = renew_weread_cookie_if_needed(raw_cookie)
 
     headers = {
         "Cookie": cookie_str,
@@ -600,6 +613,33 @@ def fetch_weread_direct_articles(
         "Origin": WEREAD_BASE,
         "Referer": f"{WEREAD_BASE}/",
     }
+
+    # 通过真实鉴权接口 /web/shelf/sync 校验 wr_skey 是否真正有效
+    try:
+        r_sync = requests.get(
+            f"{WEREAD_BASE}/web/shelf/sync",
+            params={"userVid": "", "synckey": "0"},
+            headers=headers,
+            timeout=12,
+        )
+        if r_sync.status_code == 200:
+            sj = r_sync.json()
+            if sj.get("errCode") in (-2012, -2010):
+                cookie_str = renew_weread_cookie_if_needed(cookie_str, force=True)
+                headers["Cookie"] = cookie_str
+                r_sync = requests.get(
+                    f"{WEREAD_BASE}/web/shelf/sync",
+                    params={"userVid": "", "synckey": "0"},
+                    headers=headers,
+                    timeout=12,
+                )
+                sj = r_sync.json() if r_sync.status_code == 200 else {}
+            if not sj.get("errCode") and not sj.get("errcode"):
+                diag["auth_valid"] = True
+            else:
+                diag["errors"].append(f"auth_{sj.get('errCode')}")
+    except Exception:
+        diag["errors"].append("sync_check_err")
 
     now = time.time()
     should_check_backups = check_backups or (now - _last_backup_check_ts >= 900)
@@ -612,7 +652,7 @@ def fetch_weread_direct_articles(
     for idx, (book_id, fallback_name) in enumerate(book_items):
         if sha20(book_id) in EXCLUDED_HASHES or not is_account_monitored(fallback_name, cfg):
             continue
-        is_primary = idx == 0
+        is_primary = idx < 2
         if not is_primary and not should_check_backups:
             continue
 
@@ -640,7 +680,6 @@ def fetch_weread_direct_articles(
                 title = str(cj.get("title") or "").strip()
                 acc_name = str(cj.get("name") or fallback_name).strip()
                 if rid and title and is_account_monitored(acc_name, cfg):
-                    diag["auth_valid"] = True
                     url = build_mp_url_from_review_id(rid, book_id)
                     collected.append(
                         {
@@ -839,7 +878,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Privacy-preserving feed update notifier")
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--burst-seconds", type=int, default=0)
-    parser.add_argument("--burst-interval", type=int, default=60)
+    parser.add_argument("--burst-interval", type=int, default=0)
     parser.add_argument("--test-bark", action="store_true")
     parser.add_argument("--bark-key", type=str, default="")
     parser.add_argument("--gen-qr", action="store_true")
@@ -867,21 +906,23 @@ def main() -> None:
         while True:
             round_idx += 1
             cfg = load_config()
-            last_res = run_check_cycle(cfg, force_refresh=(round_idx % 15 == 1))
+            last_res = run_check_cycle(cfg, force_refresh=(round_idx % 5 == 1))
             if last_res.get("new_articles_count", 0) > 0:
                 git_sync_state_if_needed()
-            if round_idx == 1 or round_idx % 10 == 0 or last_res.get("new_articles_count", 0) > 0:
+            sleep_sec = args.burst_interval if args.burst_interval > 0 else get_poll_interval_seconds(config=cfg)[0]
+            if round_idx == 1 or round_idx % 5 == 0 or last_res.get("new_articles_count", 0) > 0:
                 logger.info(
-                    "Patrol #%d | auth=%s | scanned=%d | new=%d",
+                    "Patrol #%d | auth=%s | scanned=%d | new=%d | next=%ds",
                     round_idx,
                     last_res.get("auth_valid"),
                     last_res.get("articles_scanned", 0),
                     last_res.get("new_articles_count", 0),
+                    sleep_sec,
                 )
             elapsed = time.time() - start_ts
-            if elapsed + args.burst_interval > args.burst_seconds:
+            if elapsed + sleep_sec > args.burst_seconds:
                 break
-            time.sleep(args.burst_interval)
+            time.sleep(sleep_sec)
         git_sync_state_if_needed()
         print(json.dumps(last_res, ensure_ascii=False, indent=2))
         return
