@@ -732,6 +732,21 @@ def save_state(state: Dict[str, Any], path: Path = STATE_PATH) -> None:
     path.write_text(json.dumps(clean_state, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def sync_remote_seen_hashes() -> set:
+    """在 GitHub Actions 环境下，直接读取 origin/main:state.json 的最新去重哈希，彻底杜绝多班次/并发交接重复推送。"""
+    if os.environ.get("GITHUB_ACTIONS") != "true":
+        return set()
+    try:
+        import subprocess
+        subprocess.run(["git", "fetch", "origin", "main", "--quiet"], cwd=BASE_DIR, check=False, timeout=15)
+        out = subprocess.check_output(["git", "show", "origin/main:state.json"], cwd=BASE_DIR, timeout=10)
+        data = json.loads(out.decode("utf-8"))
+        return set(data.get("seen_hashes") or [])
+    except Exception as exc:
+        logger.warning("Remote state sync warning: %s", exc)
+        return set()
+
+
 def run_check_cycle(
     config: Optional[Dict[str, Any]] = None,
     force_refresh: bool = False,
@@ -754,6 +769,7 @@ def run_check_cycle(
     articles, diag = fetch_weread_direct_articles(cfg, check_backups=force_refresh)
     new_articles: List[Dict[str, Any]] = []
     push_results: List[Dict[str, Any]] = []
+    remote_checked = False
 
     is_first_baseline = not state.get("baseline_synced") and len(articles) > 0
 
@@ -773,6 +789,19 @@ def run_check_cycle(
             if title_hash:
                 seen_hashes.add(title_hash)
             continue
+
+        # 推送前最后一道防线：向远端 origin/main 实时复核，若前序班次已推送则静默跳过
+        if not is_first_baseline and not remote_checked:
+            remote_hashes = sync_remote_seen_hashes()
+            remote_checked = True
+            if remote_hashes:
+                seen_hashes.update(remote_hashes)
+                if (id_hash and id_hash in seen_hashes) or (title_hash and title_hash in seen_hashes):
+                    if id_hash:
+                        seen_hashes.add(id_hash)
+                    if title_hash:
+                        seen_hashes.add(title_hash)
+                    continue
 
         if id_hash:
             seen_hashes.add(id_hash)
@@ -849,17 +878,31 @@ def get_sample_latest_article() -> Dict[str, Any]:
 
 
 def git_sync_state_if_needed() -> None:
-    """在长驻 GitHub Actions 容器运行期间，一旦发现新文章更新了 state.json，立即实时 push 回仓库。"""
+    """在长驻 GitHub Actions 容器运行期间，一旦发现新文章更新了 state.json，无冲突合并远端哈希并实时 push 回 main。"""
     if os.environ.get("GITHUB_ACTIONS") != "true":
         return
     try:
         import subprocess
+        local_state = load_state()
+        local_hashes = set(local_state.get("seen_hashes") or [])
+        remote_hashes = sync_remote_seen_hashes()
+        merged_hashes = sorted(local_hashes | remote_hashes)
+        if merged_hashes == sorted(remote_hashes):
+            local_state["seen_hashes"] = merged_hashes
+            save_state(local_state)
+            return
+
         subprocess.run(["git", "config", "user.name", "github-actions[bot]"], cwd=BASE_DIR, check=False)
         subprocess.run(
             ["git", "config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com"],
             cwd=BASE_DIR,
             check=False,
         )
+        subprocess.run(["git", "fetch", "origin", "main", "--quiet"], cwd=BASE_DIR, check=False)
+        subprocess.run(["git", "checkout", "-B", "main", "origin/main", "--quiet"], cwd=BASE_DIR, check=False)
+        local_state["seen_hashes"] = merged_hashes
+        save_state(local_state)
+
         subprocess.run(["git", "add", "state.json"], cwd=BASE_DIR, check=False)
         diff_res = subprocess.run(["git", "diff", "--staged", "--quiet"], cwd=BASE_DIR)
         if diff_res.returncode != 0:
@@ -868,7 +911,6 @@ def git_sync_state_if_needed() -> None:
                 cwd=BASE_DIR,
                 check=False,
             )
-            subprocess.run(["git", "pull", "--rebase", "origin", "main"], cwd=BASE_DIR, check=False)
             subprocess.run(["git", "push", "origin", "main"], cwd=BASE_DIR, check=False)
     except Exception as exc:
         logger.warning("Git sync warning: %s", exc)
